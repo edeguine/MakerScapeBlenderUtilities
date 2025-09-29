@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Assign Existing Material with Random Hue Shift (Multi-Base + Children Mode)",
     "author": "MakerScape",
-    "version": (1, 3, 0),
+    "version": (1, 4, 0),
     "blender": (3, 0, 0),
     "location": "3D Viewport > N-panel > Hue Assign",
     "description": "Assign a picked material and random per-object hue_adjust by name patterns OR only to the children of a picked parent object.",
@@ -13,14 +13,13 @@ import random
 import re
 
 # ------------------------------
-# Optional node setup for selected material
+# Material node setup (no vertex color)
 # ------------------------------
 
-def build_hue_nodes_on_material(mat: bpy.types.Material, color_attr_name: str = "Col"):
+def build_hue_nodes_on_material(mat: bpy.types.Material):
     """
-    Node graph:
-      [Color Attribute (layer=...)] -> [Hue/Saturation/Value] -> [Principled BSDF] -> [Output]
-      [Attribute (Geometry, name='hue_adjust') Fac] ---------> [HSV.Hue]
+    Build:
+        [Attribute name='hue_adjust' (Fac)] -> [ColorRamp] -> [Principled BSDF] -> [Material Output]
     """
     if mat is None:
         raise ValueError("No material provided.")
@@ -32,49 +31,63 @@ def build_hue_nodes_on_material(mat: bpy.types.Material, color_attr_name: str = 
     links = nt.links
     nodes.clear()
 
-    out = nodes.new("ShaderNodeOutputMaterial"); out.location = (800, 0)
-    principled = nodes.new("ShaderNodeBsdfPrincipled"); principled.location = (550, 0)
-    hsv = nodes.new("ShaderNodeHueSaturation"); hsv.location = (300, 50)
+    # Output
+    out = nodes.new("ShaderNodeOutputMaterial"); out.location = (820, 0)
 
-    color_attr_node = None
-    if "ShaderNodeVertexColor" in bpy.types.__dir__():
-        color_attr_node = nodes.new("ShaderNodeVertexColor")
-        # In many builds the property is layer_name; falling back is harmless as a no-op.
-        try:
-            color_attr_node.layer_name = color_attr_name
-        except Exception:
-            try:
-                color_attr_node.attribute_name = color_attr_name
-            except Exception:
-                pass
-    else:
-        color_attr_node = nodes.new("ShaderNodeAttribute")
-        color_attr_node.attribute_name = color_attr_name
-    color_attr_node.location = (0, -40)
+    # Principled
+    principled = nodes.new("ShaderNodeBsdfPrincipled"); principled.location = (560, 0)
+    principled.inputs["Metallic"].default_value  = 0.483
+    principled.inputs["Roughness"].default_value = 0.645
+    principled.inputs["IOR"].default_value       = 1.500
+    principled.inputs["Alpha"].default_value     = 1.000
 
-    attr_hue = nodes.new("ShaderNodeAttribute")
-    attr_hue.location = (0, 180)
-    attr_hue.attribute_name = "hue_adjust"
+    # ColorRamp (keep at least 2 elements at all times)
+    cr = nodes.new("ShaderNodeValToRGB"); cr.location = (300, 0)
+    cr.color_ramp.interpolation = 'LINEAR'
+    ramp = cr.color_ramp
 
-    links.new(color_attr_node.outputs.get("Color"), hsv.inputs["Color"])
-    links.new(attr_hue.outputs.get("Fac"), hsv.inputs["Hue"])
-    links.new(hsv.outputs["Color"], principled.inputs["Base Color"])
+    # Desired stops (pos, (r,g,b))
+    stops = [
+        (0.00, (0.310, 0.090, 0.060)),
+        (0.20, (0.620, 0.180, 0.080)),
+        (0.40, (0.820, 0.290, 0.120)),
+        (0.65, (0.940, 0.530, 0.230)),
+        (0.88, (0.980, 0.780, 0.550)),
+        (0.95, (0.990, 0.930, 0.800)),
+    ]
+
+    # Ensure the ramp has exactly two base elements, then add the middle ones
+    while len(ramp.elements) > 2:
+        ramp.elements.remove(ramp.elements[-1])
+
+    e0, e1 = ramp.elements[0], ramp.elements[1]
+    # First stop
+    e0.position = stops[0][0]
+    r, g, b = stops[0][1]
+    e0.color = (r, g, b, 1.0)
+    # Last stop
+    e1.position = stops[-1][0]
+    r, g, b = stops[-1][1]
+    e1.color = (r, g, b, 1.0)
+
+    # Insert middle stops
+    for pos, rgb in stops[1:-1]:
+        e = ramp.elements.new(pos)
+        r, g, b = rgb
+        e.color = (r, g, b, 1.0)
+
+    # Attribute (hue_adjust) → Fac
+    attr = nodes.new("ShaderNodeAttribute"); attr.location = (60, 0)
+    attr.attribute_name = "hue_adjust"
+
+    # Links
+    links.new(attr.outputs["Fac"], cr.inputs["Fac"])
+    links.new(cr.outputs["Color"], principled.inputs["Base Color"])
     links.new(principled.outputs["BSDF"], out.inputs["Surface"])
 
 # ------------------------------
-# Mesh helpers
+# Mesh attribute helper (write hue_adjust)
 # ------------------------------
-
-def ensure_color_attribute(mesh: bpy.types.Mesh, color_attr_name: str = "Col"):
-    col_attr = mesh.color_attributes.get(color_attr_name)
-    if col_attr is None:
-        col_attr = mesh.color_attributes.new(
-            name=color_attr_name, domain='CORNER', type='BYTE_COLOR'
-        )
-        for i in range(len(col_attr.data)):
-            c = col_attr.data[i].color
-            c[0], c[1], c[2], c[3] = 1.0, 1.0, 1.0, 1.0
-    return col_attr
 
 def write_uniform_float_attribute(mesh: bpy.types.Mesh, attr_name: str, value: float):
     attr = mesh.attributes.get(attr_name)
@@ -92,37 +105,32 @@ def write_uniform_float_attribute(mesh: bpy.types.Mesh, attr_name: str, value: f
 class HueAssignBaseNameItem(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(
         name="Base",
-        description="Base object name prefix (matches 'Base' or 'Base 1', 'Base 2', ...)"
+        description="Base object name prefix (matches 'Base', 'Base 1', 'Base.001', ...)"
     )
 
 class HueAssignProps(bpy.types.PropertyGroup):
-    # --- Mode switch ---
+    # Mode
     mode: bpy.props.EnumProperty(
         name="Mode",
         items=[
-            ("NAME", "By Base Names", "Match objects by name patterns (original behavior)"),
-            ("CHILDREN", "Children of Picked Parent", "Affect only the direct children of a picked parent"),
+            ("NAME", "By Base Names", "Match objects by name patterns"),
+            ("CHILDREN", "Children of Picked Parent", "Affect only direct children of a picked parent"),
         ],
         default="NAME",
     )
 
-    # NAME mode properties
+    # NAME mode
     base_names: bpy.props.CollectionProperty(type=HueAssignBaseNameItem)
     base_names_index: bpy.props.IntProperty(default=0)
 
-    # CHILDREN mode properties
+    # CHILDREN mode
     parent_object: bpy.props.PointerProperty(
         name="Parent Object",
         description="Only direct children of this object will be processed",
         type=bpy.types.Object,
     )
 
-    # Shared props
-    color_attribute_name: bpy.props.StringProperty(
-        name="Vertex Color",
-        default="Col",
-        description="Vertex color layer name read by the material"
-    )
+    # Shared
     hue_min: bpy.props.FloatProperty(
         name="Hue Min",
         default=-1.0, soft_min=-2.0, soft_max=2.0,
@@ -140,7 +148,7 @@ class HueAssignProps(bpy.types.PropertyGroup):
     )
     target_material: bpy.props.PointerProperty(
         name="Material",
-        description="Pick the material you created (will be reused on all matches)",
+        description="Pick the material that will receive the Attribute→ColorRamp setup",
         type=bpy.types.Material
     )
 
@@ -152,7 +160,7 @@ class UI_UL_base_names(bpy.types.UIList):
     bl_idname = "UI_UL_base_names_list"
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
-        row.prop(item, "name", text="", emboss=True, icon='OUTLINER_DATA_GREASEPENCIL')
+        row.prop(item, "name", text="", emboss=True, icon='OUTLINER_OB_MESH')
 
 class LIST_OT_add_base(bpy.types.Operator):
     bl_idname = "hue_assign.add_base"
@@ -161,7 +169,7 @@ class LIST_OT_add_base(bpy.types.Operator):
     def execute(self, context):
         props = context.scene.hue_assign_props
         item = props.base_names.add()
-        item.name = "body instance"
+        item.name = "Body"
         props.base_names_index = len(props.base_names) - 1
         return {'FINISHED'}
 
@@ -206,11 +214,11 @@ class OBJ_OT_setup_selected_material(bpy.types.Operator):
             self.report({'ERROR'}, "Pick a material in the UI first.")
             return {'CANCELLED'}
         try:
-            build_hue_nodes_on_material(mat, props.color_attribute_name)
+            build_hue_nodes_on_material(mat)
         except Exception as e:
             self.report({'ERROR'}, f"Could not set up material: {e}")
             return {'CANCELLED'}
-        self.report({'INFO'}, f"Material '{mat.name}' configured.")
+        self.report({'INFO'}, f"Material '{mat.name}' configured (Attribute→ColorRamp→Principled).")
         return {'FINISHED'}
 
 class OBJ_OT_assign_hue_material(bpy.types.Operator):
@@ -226,7 +234,9 @@ class OBJ_OT_assign_hue_material(bpy.types.Operator):
             if not base:
                 continue
             base_escaped = re.escape(base)
-            patterns.append(re.compile(rf"^{base_escaped}(?: \d+)?$", re.IGNORECASE))
+            # Match: "basename", "basename 3", "basename.003"
+            pat = re.compile(rf"^{base_escaped}(?: \d+|\.\d{{3}})?$", re.IGNORECASE)
+            patterns.append(pat)
 
         for obj in context.scene.objects:
             if obj.type != 'MESH':
@@ -257,7 +267,7 @@ class OBJ_OT_assign_hue_material(bpy.types.Operator):
                 self.report({'ERROR'}, "Add at least one base name.")
                 return {'CANCELLED'}
             gen = self._targets_by_name(context, props)
-        else:  # CHILDREN
+        else:
             gen = self._targets_children(context, props)
             if gen is None:
                 return {'CANCELLED'}
@@ -267,13 +277,14 @@ class OBJ_OT_assign_hue_material(bpy.types.Operator):
 
         for obj in gen:
             me = obj.data
-            ensure_color_attribute(me, props.color_attribute_name)
 
+            # Assign/overwrite material slot 0
             if me.materials:
                 me.materials[0] = mat
             else:
                 me.materials.append(mat)
 
+            # Write uniform hue_adjust to mesh attribute
             hue_adj = rnd.uniform(props.hue_min, props.hue_max)
             write_uniform_float_attribute(me, "hue_adjust", hue_adj)
             me.update()
@@ -302,15 +313,11 @@ class VIEW3D_PT_hue_assign(bpy.types.Panel):
         col = layout.column(align=True)
         col.label(text="Material")
         col.prop(props, "target_material")
-        col.prop(props, "color_attribute_name")
         col.operator(OBJ_OT_setup_selected_material.bl_idname, text="Setup Selected Material", icon='NODETREE')
 
         layout.separator()
-
-        # Mode selector
         layout.prop(props, "mode", text="")
 
-        # Mode-specific UI
         if props.mode == "NAME":
             col = layout.column(align=True)
             col.label(text="Base Names")
@@ -326,8 +333,7 @@ class VIEW3D_PT_hue_assign(bpy.types.Panel):
             col.label(text="Children Mode")
             col.prop(props, "parent_object", text="Parent")
             if props.parent_object is None and context.view_layer.objects.active:
-                row = col.row()
-                row.enabled = False
+                row = col.row(); row.enabled = False
                 row.label(text=f"(Active: {context.view_layer.objects.active.name})")
 
         layout.separator()
